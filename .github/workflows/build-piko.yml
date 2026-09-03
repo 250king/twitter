@@ -25,7 +25,7 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
       GH_TOKEN: ${{ github.token }}
 
@@ -45,14 +45,15 @@ jobs:
           python-version: "3.12"
           cache: pip
 
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        shell: bash
+        run: sdkmanager "build-tools;35.0.0"
+
       - name: Install Python dependencies
         run: pip install -r requirements.txt
-
-      - name: Restore Morphe signing keystore
-        uses: actions/cache@v4
-        with:
-          path: morphe-data/morphe.keystore
-          key: morphe-signing-keystore-v1
 
       - name: Resolve X version
         id: version
@@ -91,12 +92,39 @@ jobs:
         if: steps.existing.outputs.exists == 'true' && inputs.force != true
         run: echo "Nothing to do; this version is already published."
 
+      - name: Prepare custom signing key
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          for NAME in ANDROID_KEYSTORE_BASE64 ANDROID_KEYSTORE_PASSWORD ANDROID_KEY_ALIAS ANDROID_KEY_PASSWORD; do
+            if [[ -z "${!NAME:-}" ]]; then
+              echo "::error::Missing GitHub Actions secret: $NAME"
+              exit 1
+            fi
+          done
+
+          mkdir -p work dist
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > work/signing.keystore
+          test -s work/signing.keystore
+
+          keytool -list \
+            -keystore work/signing.keystore \
+            -storepass "$ANDROID_KEYSTORE_PASSWORD" \
+            -alias "$ANDROID_KEY_ALIAS" >/dev/null
+
+          echo "Custom Android signing key loaded successfully."
+
       - name: Download original APKM from APKMirror
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p work dist
           python scripts/apkmirror.py download '${{ steps.version.outputs.version }}' work/x.apkm
           test -s work/x.apkm
 
@@ -132,30 +160,72 @@ jobs:
           curl --fail --location --retry 4 --retry-delay 5 "$URL" -o piko.mpp
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Build universal APK
+      - name: Build and sign all variants
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
         shell: bash
+        env:
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           VERSION='${{ steps.version.outputs.version }}'
-          java -jar morphe.jar patch \
-            --patches piko.mpp \
-            --out "dist/x-piko-${VERSION}-universal.apk" \
-            work/x.apkm
+          APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
+          ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
 
-      - name: Build architecture APKs
-        if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          VERSION='${{ steps.version.outputs.version }}'
-          for ABI in arm64-v8a armeabi-v7a x86 x86_64; do
-            echo "Building $ABI..."
-            java -jar morphe.jar patch \
-              --patches piko.mpp \
-              --striplibs "$ABI" \
-              --out "dist/x-piko-${VERSION}-${ABI}.apk" \
-              work/x.apkm
+          VARIANTS=(twitter-material twitter x-material x)
+          ARCHES=(universal arm64-v8a armeabi-v7a x86 x86_64)
+
+          for VARIANT in "${VARIANTS[@]}"; do
+            case "$VARIANT" in
+              twitter-material)
+                PATCH_FLAGS=(-e "Bring back twitter" -e "Dynamic color")
+                ;;
+              twitter)
+                PATCH_FLAGS=(-e "Bring back twitter" -d "Dynamic color")
+                ;;
+              x-material)
+                PATCH_FLAGS=(-d "Bring back twitter" -e "Dynamic color")
+                ;;
+              x)
+                PATCH_FLAGS=(-d "Bring back twitter" -d "Dynamic color")
+                ;;
+            esac
+
+            for ARCH in "${ARCHES[@]}"; do
+              echo "Building ${VARIANT} / ${ARCH}..."
+              STRIP_FLAGS=()
+              if [[ "$ARCH" != "universal" ]]; then
+                STRIP_FLAGS=(--striplibs "$ARCH")
+              fi
+
+              UNSIGNED="work/${VARIANT}-${ARCH}-unsigned.apk"
+              ALIGNED="work/${VARIANT}-${ARCH}-aligned.apk"
+              FINAL="dist/x-piko-${VERSION}-${VARIANT}-${ARCH}.apk"
+
+              java -jar morphe.jar patch \
+                --patches piko.mpp \
+                "${PATCH_FLAGS[@]}" \
+                "${STRIP_FLAGS[@]}" \
+                --unsigned \
+                --out "$UNSIGNED" \
+                work/x.apkm
+
+              "$ZIPALIGN" -p -f 4 "$UNSIGNED" "$ALIGNED"
+
+              "$APKSIGNER" sign \
+                --ks work/signing.keystore \
+                --ks-key-alias "$ANDROID_KEY_ALIAS" \
+                --ks-pass env:ANDROID_KEYSTORE_PASSWORD \
+                --key-pass env:ANDROID_KEY_PASSWORD \
+                --out "$FINAL" \
+                "$ALIGNED"
+
+              "$APKSIGNER" verify --verbose "$FINAL"
+              rm -f "$UNSIGNED" "$ALIGNED"
+            done
           done
 
       - name: Validate build outputs
@@ -163,13 +233,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.version }}'
-          for FILE in \
-            "dist/x-piko-${VERSION}-universal.apk" \
-            "dist/x-piko-${VERSION}-arm64-v8a.apk" \
-            "dist/x-piko-${VERSION}-armeabi-v7a.apk" \
-            "dist/x-piko-${VERSION}-x86.apk" \
-            "dist/x-piko-${VERSION}-x86_64.apk"; do
+          COUNT="$(find dist -maxdepth 1 -type f -name '*.apk' | wc -l)"
+          if [[ "$COUNT" -ne 20 ]]; then
+            echo "Expected 20 APKs, found $COUNT" >&2
+            exit 1
+          fi
+
+          for FILE in dist/*.apk; do
             test -s "$FILE"
             unzip -tq "$FILE" >/dev/null
             sha256sum "$FILE"
@@ -187,21 +257,27 @@ jobs:
           set -euo pipefail
           VERSION='${{ steps.version.outputs.version }}'
           cat > release-notes.md <<EOF
-          Automated X/Twitter build patched with Piko.
+          Automated X/Twitter build patched with Piko and signed with the repository owner's Android signing key.
 
           - X: \`${VERSION}\`
           - Piko: \`${{ steps.piko.outputs.tag }}\`
           - Morphe: \`${{ steps.morphe.outputs.tag }}\`
           - Source APKM: APKMirror universal bundle
 
-          APK variants:
+          UI / branding variants:
+          - \`twitter-material\`: Twitter branding + Material You dynamic color
+          - \`twitter\`: Twitter branding + standard Twitter/X colors
+          - \`x-material\`: X branding + Material You dynamic color
+          - \`x\`: X branding + standard Twitter/X colors
+
+          Architecture variants for every UI / branding variant:
           - \`arm64-v8a\`: most modern Android phones
           - \`armeabi-v7a\`: older 32-bit ARM devices
           - \`x86_64\`: 64-bit Intel emulators / Chromebooks
           - \`x86\`: legacy 32-bit Intel emulators
           - \`universal\`: keeps all native architectures
 
-          The APKs are signed by Morphe. The workflow caches the Morphe signing keystore so later releases can update over earlier builds.
+          Total: 4 UI / branding variants × 5 architecture variants = 20 APKs.
           EOF
 
           gh release create "$VERSION" dist/*.apk \
