@@ -1,0 +1,210 @@
+name: Build latest X with Piko
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "X version, e.g. 12.19.1-release.0 (blank = latest APKMirror release)"
+        required: false
+        type: string
+      force:
+        description: "Build even when the release tag already exists"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: piko-release-builder
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ github.token }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore Morphe signing keystore
+        uses: actions/cache@v4
+        with:
+          path: morphe-data/morphe.keystore
+          key: morphe-signing-keystore-v1
+
+      - name: Resolve X version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          REQUESTED='${{ inputs.version }}'
+          if [[ -n "$REQUESTED" ]]; then
+            VERSION="$REQUESTED"
+          else
+            VERSION="$(python scripts/apkmirror.py latest)"
+          fi
+
+          if [[ "$VERSION" != *release* ]]; then
+            echo "Refusing non-release version: $VERSION" >&2
+            exit 1
+          fi
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved X version: $VERSION"
+
+      - name: Check whether release already exists
+        id: existing
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          if gh release view "$VERSION" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $VERSION already exists."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop when already published
+        if: steps.existing.outputs.exists == 'true' && inputs.force != true
+        run: echo "Nothing to do; this version is already published."
+
+      - name: Download original APKM from APKMirror
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work dist
+          python scripts/apkmirror.py download '${{ steps.version.outputs.version }}' work/x.apkm
+          test -s work/x.apkm
+
+      - name: Download latest stable Morphe CLI
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        id: morphe
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(gh api repos/MorpheApp/morphe-desktop/releases/latest)"
+          TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
+          URL="$(jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
+          if [[ -z "$URL" || "$URL" == "null" ]]; then
+            echo "Could not resolve Morphe CLI asset" >&2
+            exit 1
+          fi
+          curl --fail --location --retry 4 --retry-delay 5 "$URL" -o morphe.jar
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve latest stable Piko release
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        id: piko
+        shell: bash
+        run: |
+          set -euo pipefail
+          RELEASE_JSON="$(gh api repos/crimera/piko/releases/latest)"
+          TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
+          URL="$(jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
+          if [[ -z "$URL" || "$URL" == "null" ]]; then
+            echo "Could not resolve Piko .mpp asset" >&2
+            exit 1
+          fi
+          curl --fail --location --retry 4 --retry-delay 5 "$URL" -o piko.mpp
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build universal APK
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          java -jar morphe.jar patch \
+            --patches piko.mpp \
+            --out "dist/x-piko-${VERSION}-universal.apk" \
+            work/x.apkm
+
+      - name: Build architecture APKs
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          for ABI in arm64-v8a armeabi-v7a x86 x86_64; do
+            echo "Building $ABI..."
+            java -jar morphe.jar patch \
+              --patches piko.mpp \
+              --striplibs "$ABI" \
+              --out "dist/x-piko-${VERSION}-${ABI}.apk" \
+              work/x.apkm
+          done
+
+      - name: Validate build outputs
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          for FILE in \
+            "dist/x-piko-${VERSION}-universal.apk" \
+            "dist/x-piko-${VERSION}-arm64-v8a.apk" \
+            "dist/x-piko-${VERSION}-armeabi-v7a.apk" \
+            "dist/x-piko-${VERSION}-x86.apk" \
+            "dist/x-piko-${VERSION}-x86_64.apk"; do
+            test -s "$FILE"
+            unzip -tq "$FILE" >/dev/null
+            sha256sum "$FILE"
+          done
+
+      - name: Replace existing release when force rebuilding
+        if: steps.existing.outputs.exists == 'true' && inputs.force == true
+        shell: bash
+        run: gh release delete '${{ steps.version.outputs.version }}' --yes --cleanup-tag
+
+      - name: Publish GitHub release
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION='${{ steps.version.outputs.version }}'
+          cat > release-notes.md <<EOF
+          Automated X/Twitter build patched with Piko.
+
+          - X: \`${VERSION}\`
+          - Piko: \`${{ steps.piko.outputs.tag }}\`
+          - Morphe: \`${{ steps.morphe.outputs.tag }}\`
+          - Source APKM: APKMirror universal bundle
+
+          APK variants:
+          - \`arm64-v8a\`: most modern Android phones
+          - \`armeabi-v7a\`: older 32-bit ARM devices
+          - \`x86_64\`: 64-bit Intel emulators / Chromebooks
+          - \`x86\`: legacy 32-bit Intel emulators
+          - \`universal\`: keeps all native architectures
+
+          The APKs are signed by Morphe. The workflow caches the Morphe signing keystore so later releases can update over earlier builds.
+          EOF
+
+          gh release create "$VERSION" dist/*.apk \
+            --title "$VERSION" \
+            --notes-file release-notes.md \
+            --latest
