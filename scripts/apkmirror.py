@@ -12,7 +12,6 @@ import cloudscraper
 from bs4 import BeautifulSoup, Tag
 
 BASE = "https://www.apkmirror.com"
-APP_URL = f"{BASE}/apk/x-corp/twitter/"
 
 
 @dataclass
@@ -53,35 +52,7 @@ def get(url: str):
     return response
 
 
-def get_versions() -> list[Version]:
-    soup = BeautifulSoup(get(APP_URL).text, "html.parser")
-    widget = soup.find("div", class_="listWidget")
-    if widget is None:
-        raise RuntimeError("Could not find APKMirror version list")
-
-    versions: list[Version] = []
-    for row in cast(Tag, widget).find_all("div", recursive=False)[1:]:
-        value = row.find("span", class_="infoSlide-value")
-        anchor = row.find("a", href=True)
-        if value is None or anchor is None:
-            continue
-        text = value.get_text(strip=True)
-        versions.append(Version(text, urljoin(BASE, cast(Tag, anchor)["href"])))
-    return versions
-
-
-def latest_release() -> Version:
-    for item in get_versions():
-        if "release" in item.version.lower():
-            return item
-    raise RuntimeError("Could not find an X release build on APKMirror")
-
-
 def version_from_string(version: str) -> Version:
-    for item in get_versions():
-        if item.version == version:
-            return item
-
     slug = version.replace(".", "-")
     return Version(version, f"{BASE}/apk/x-corp/twitter/x-{slug}-release/")
 
@@ -157,17 +128,11 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("latest")
-
     download = sub.add_parser("download")
     download.add_argument("version")
     download.add_argument("output", type=Path)
 
     args = parser.parse_args()
-    if args.command == "latest":
-        print(latest_release().version)
-        return 0
-
     if args.command == "download":
         download_bundle(version_from_string(args.version), args.output)
         return 0
