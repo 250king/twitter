@@ -1,6 +1,6 @@
 # X / Twitter + Piko automated builds
 
-Automatically watches APKMirror for new X/Twitter releases, patches them with [Piko](https://github.com/crimera/piko) using [Morphe](https://github.com/MorpheApp/morphe-desktop), signs them with a custom Android signing key, and publishes architecture-specific APKs plus universal APKs.
+Automatically watches the latest stable [Piko](https://github.com/crimera/piko) release for its supported X/Twitter version, downloads the matching APKM from APKMirror, patches it with Piko using [Morphe](https://github.com/MorpheApp/morphe-desktop), signs it with a custom Android signing key, and publishes architecture-specific APKs plus universal APKs.
 
 > Unofficial build automation. X/Twitter, Piko and Morphe are separate upstream projects.
 
@@ -50,4 +50,6 @@ The workflow intentionally fails if any signing secret is missing so it never si
 
 ## Automation
 
-The workflow checks APKMirror every six hours and can also be triggered manually. Manual runs can specify an X version and can force-rebuild an existing release.
+The workflow checks the latest stable Piko release every six hours, reads Piko's machine-readable supported X/Twitter target, and only asks APKMirror for that exact APKM. If that X version has already been published in this repository, the workflow exits before installing the Java, Python, and Android build environments.
+
+The workflow can also be triggered manually. Manual runs may specify an X version, but it must be supported by the latest stable Piko release. They can also force-rebuild an existing release.
