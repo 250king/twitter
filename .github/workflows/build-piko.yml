@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "X version, e.g. 12.19.1-release.0 (blank = latest APKMirror release)"
+        description: "X version supported by latest stable Piko (blank = newest supported version)"
         required: false
         type: string
       force:
@@ -33,54 +33,69 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Set up Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "21"
-
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-          cache: pip
-
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android build tools
+      - name: Resolve Piko and supported X version
+        id: target
         shell: bash
-        run: sdkmanager "build-tools;35.0.0"
-
-      - name: Install Python dependencies
-        run: pip install -r requirements.txt
-
-      - name: Resolve X version
-        id: version
-        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ inputs.version }}
         run: |
           set -euo pipefail
-          REQUESTED='${{ inputs.version }}'
-          if [[ -n "$REQUESTED" ]]; then
-            VERSION="$REQUESTED"
-          else
-            VERSION="$(python scripts/apkmirror.py latest)"
-          fi
 
-          if [[ "$VERSION" != *release* ]]; then
-            echo "Refusing non-release version: $VERSION" >&2
+          RELEASE_JSON="$(gh api repos/crimera/piko/releases/latest)"
+          PIKO_TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
+          PIKO_URL="$(jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
+
+          if [[ -z "$PIKO_URL" || "$PIKO_URL" == "null" ]]; then
+            echo "::error::Could not resolve Piko .mpp asset"
             exit 1
           fi
 
+          PATCHES_JSON="$(
+            curl --fail --silent --show-error --location \
+              "https://raw.githubusercontent.com/crimera/piko/${PIKO_TAG}/patches-list.json"
+          )"
+
+          mapfile -t TARGETS < <(
+            jq -r '
+              [
+                .patches[].compatiblePackages[]?
+                | select(.packageName == "com.twitter.android")
+                | .targets[]?
+                | select(.isExperimental != true)
+                | .version
+              ]
+              | unique
+              | .[]
+            ' <<<"$PATCHES_JSON"
+          )
+
+          if (( ${#TARGETS[@]} == 0 )); then
+            echo "::error::Piko ${PIKO_TAG} exposes no stable X target"
+            exit 1
+          fi
+
+          if [[ -n "$REQUESTED_VERSION" ]]; then
+            if ! printf '%s\n' "${TARGETS[@]}" | grep -Fxq "$REQUESTED_VERSION"; then
+              echo "::error::X ${REQUESTED_VERSION} is not supported by Piko ${PIKO_TAG}"
+              echo "Supported: ${TARGETS[*]}"
+              exit 1
+            fi
+            VERSION="$REQUESTED_VERSION"
+          else
+            VERSION="$(printf '%s\n' "${TARGETS[@]}" | sort -V | tail -n1)"
+          fi
+
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved X version: $VERSION"
+          echo "piko_tag=$PIKO_TAG" >> "$GITHUB_OUTPUT"
+          echo "piko_url=$PIKO_URL" >> "$GITHUB_OUTPUT"
+          echo "Piko ${PIKO_TAG} -> X ${VERSION}"
 
       - name: Check whether release already exists
         id: existing
         shell: bash
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.version }}'
+          VERSION='${{ steps.target.outputs.version }}'
           if gh release view "$VERSION" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "Release $VERSION already exists."
@@ -91,6 +106,33 @@ jobs:
       - name: Stop when already published
         if: steps.existing.outputs.exists == 'true' && inputs.force != true
         run: echo "Nothing to do; this version is already published."
+
+      - name: Set up Java
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Python
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Set up Android SDK
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        shell: bash
+        run: sdkmanager "build-tools;35.0.0"
+
+      - name: Install Python dependencies
+        if: steps.existing.outputs.exists != 'true' || inputs.force == true
+        run: pip install -r requirements.txt
 
       - name: Prepare custom signing key
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
@@ -125,7 +167,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python scripts/apkmirror.py download '${{ steps.version.outputs.version }}' work/x.apkm
+          python scripts/apkmirror.py download '${{ steps.target.outputs.version }}' work/x.apkm
           test -s work/x.apkm
 
       - name: Download latest stable Morphe CLI
@@ -144,21 +186,15 @@ jobs:
           curl --fail --location --retry 4 --retry-delay 5 "$URL" -o morphe.jar
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
 
-      - name: Resolve latest stable Piko release
+      - name: Download Piko patches
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        id: piko
         shell: bash
         run: |
           set -euo pipefail
-          RELEASE_JSON="$(gh api repos/crimera/piko/releases/latest)"
-          TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
-          URL="$(jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
-          if [[ -z "$URL" || "$URL" == "null" ]]; then
-            echo "Could not resolve Piko .mpp asset" >&2
-            exit 1
-          fi
-          curl --fail --location --retry 4 --retry-delay 5 "$URL" -o piko.mpp
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          curl --fail --location --retry 4 --retry-delay 5 \
+            '${{ steps.target.outputs.piko_url }}' \
+            -o piko.mpp
+          test -s piko.mpp
 
       - name: Build and sign all variants
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
@@ -169,7 +205,7 @@ jobs:
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.version }}'
+          VERSION='${{ steps.target.outputs.version }}'
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
           ZIPALIGN="$ANDROID_HOME/build-tools/35.0.0/zipalign"
           test -x "$APKSIGNER"
@@ -248,19 +284,19 @@ jobs:
       - name: Replace existing release when force rebuilding
         if: steps.existing.outputs.exists == 'true' && inputs.force == true
         shell: bash
-        run: gh release delete '${{ steps.version.outputs.version }}' --yes --cleanup-tag
+        run: gh release delete '${{ steps.target.outputs.version }}' --yes --cleanup-tag
 
       - name: Publish GitHub release
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
         shell: bash
         run: |
           set -euo pipefail
-          VERSION='${{ steps.version.outputs.version }}'
+          VERSION='${{ steps.target.outputs.version }}'
           cat > release-notes.md <<EOF
           Automated X/Twitter build patched with Piko and signed with the repository owner's Android signing key.
 
           - X: \`${VERSION}\`
-          - Piko: \`${{ steps.piko.outputs.tag }}\`
+          - Piko: \`${{ steps.target.outputs.piko_tag }}\`
           - Morphe: \`${{ steps.morphe.outputs.tag }}\`
           - Source APKM: APKMirror universal bundle
 
