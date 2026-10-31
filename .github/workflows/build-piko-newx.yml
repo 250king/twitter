@@ -84,7 +84,8 @@ jobs:
 
           mapfile -t TARGETS < <(
             java -jar morphe.jar list-versions --patches piko.mpp -f com.twitter.android \
-              | sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+\([0-9]+ patches?\)[[:space:]]*$/\1/p'
+              | sed -E 's/\x1b\[[0-9;]*m//g' \
+              | sed -nE 's/^[[:space:]]*([0-9][^[:space:]]*).*\([0-9]+ patch(es)?\)[[:space:]]*$/\1/p'
           )
 
           if (( ${#TARGETS[@]} == 0 )); then
