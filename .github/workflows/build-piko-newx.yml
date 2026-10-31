@@ -156,7 +156,7 @@ jobs:
 
       - name: Set up Android SDK
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        uses: android-actions/setup-android@v3
+        uses: android-actions/setup-android@v4
 
       - name: Install Android build tools
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
