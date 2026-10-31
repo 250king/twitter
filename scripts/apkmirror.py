@@ -9,8 +9,8 @@ from pathlib import Path
 from typing import cast
 from urllib.parse import urljoin
 
-import cloudscraper
 from bs4 import BeautifulSoup, Tag
+from curl_cffi import requests as curl_requests
 
 BASE = "https://www.apkmirror.com"
 
@@ -41,14 +41,12 @@ _scraper = None
 def scraper():
     global _scraper
     if _scraper is None:
-        _scraper = cloudscraper.create_scraper()
+        # APKMirror sits behind Cloudflare, which rejects the TLS fingerprint of
+        # plain requests/cloudscraper. curl_cffi impersonates a real Chrome.
+        _scraper = curl_requests.Session(impersonate="chrome")
         _scraper.headers.update(
             {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/156.0.0.0 Safari/537.36"
-                )
+                "Accept-Language": "en-US,en;q=0.9",
             }
         )
     return _scraper
@@ -146,18 +144,21 @@ def download_bundle(version: Version, output: Path) -> None:
 
     direct_url = urljoin(BASE, cast(Tag, direct)["href"])
     print(f"Downloading {version.version} from {direct_url}", file=sys.stderr)
-    with scraper().get(
+    response = scraper().get(
         direct_url,
         headers={"Referer": download_page_url},
         timeout=120,
         stream=True,
-    ) as response:
+    )
+    try:
         response.raise_for_status()
         output.parent.mkdir(parents=True, exist_ok=True)
         with output.open("wb") as fh:
             for chunk in response.iter_content(chunk_size=1024 * 1024):
                 if chunk:
                     fh.write(chunk)
+    finally:
+        response.close()
 
 
 def main() -> int:
