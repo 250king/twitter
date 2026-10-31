@@ -52,6 +52,8 @@ The workflow checks the latest stable Piko NewX release every six hours. It down
 
 If that X version has already been published in this repository, the workflow exits before installing the Python and Android build environments.
 
+The source APKM is downloaded once, then all six APKs are built in parallel as a GitHub Actions matrix. The release is published only after every variant succeeds.
+
 The workflow can also be triggered manually:
 
 - `version` — build a specific X version supported by the latest stable Piko NewX release
