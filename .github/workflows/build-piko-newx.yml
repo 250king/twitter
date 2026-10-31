@@ -246,7 +246,7 @@ jobs:
             fi
           done
 
-          mkdir -p dist
+          mkdir -p work dist
           printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > signing.keystore
           test -s signing.keystore
 
