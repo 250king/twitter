@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +13,12 @@ import cloudscraper
 from bs4 import BeautifulSoup, Tag
 
 BASE = "https://www.apkmirror.com"
+
+ARCHITECTURE_PATTERN = re.compile(
+    r"\b(universal|arm64-v8a|armeabi-v7a|x86_64|x86)\b",
+    re.IGNORECASE,
+)
+DPI_PATTERN = re.compile(r"\b(?:\d+-\d+dpi|nodpi)\b", re.IGNORECASE)
 
 
 @dataclass
@@ -24,6 +31,7 @@ class Version:
 class Variant:
     is_bundle: bool
     architecture: str
+    dpi: str
     link: str
 
 
@@ -73,30 +81,58 @@ def get_variants(version: Version) -> list[Variant]:
         anchor = row.find("a", class_="accent_color", href=True)
         if anchor is None:
             continue
-        architecture = cells[1].get_text(" ", strip=True)
+
+        cell_texts = [cell.get_text(" ", strip=True) for cell in cells]
+        architecture = next(
+            (text for text in cell_texts if ARCHITECTURE_PATTERN.search(text)),
+            cell_texts[1],
+        )
+        dpi = next((text for text in cell_texts if DPI_PATTERN.search(text)), "")
+
         variants.append(
             Variant(
                 is_bundle=badge is not None and badge.get_text(strip=True) == "BUNDLE",
                 architecture=architecture,
+                dpi=dpi,
                 link=urljoin(BASE, cast(Tag, anchor)["href"]),
             )
         )
     return variants
 
 
-def choose_universal_bundle(version: Version) -> Variant:
+def bundle_score(variant: Variant) -> tuple[int, int, int, int]:
+    """Prefer ARM bundles with both ABIs, then modern phone DPI buckets."""
+    architecture = variant.architecture.lower()
+    dpi = variant.dpi.lower()
+
+    has_arm = int("arm64-v8a" in architecture or "armeabi-v7a" in architecture)
+    has_both_arm_abis = int(
+        "arm64-v8a" in architecture and "armeabi-v7a" in architecture
+    )
+    preferred_dpi = int("480-640" in dpi or "640" in dpi)
+    has_arm64 = int("arm64-v8a" in architecture)
+    return has_arm, has_both_arm_abis, preferred_dpi, has_arm64
+
+
+def choose_source_bundle(version: Version) -> Variant:
     variants = get_variants(version)
+
     for variant in variants:
         if variant.is_bundle and "universal" in variant.architecture.lower():
             return variant
-    raise RuntimeError(
-        f"Could not find a universal APKM bundle for X {version.version}. "
-        f"Found: {[(v.architecture, v.is_bundle) for v in variants]}"
-    )
+
+    bundles = [variant for variant in variants if variant.is_bundle]
+    if not bundles:
+        raise RuntimeError(
+            f"Could not find an APKM bundle for X {version.version}. "
+            f"Found: {[(v.architecture, v.dpi, v.is_bundle) for v in variants]}"
+        )
+
+    return max(bundles, key=bundle_score)
 
 
 def download_bundle(version: Version, output: Path) -> None:
-    variant = choose_universal_bundle(version)
+    variant = choose_source_bundle(version)
     page = BeautifulSoup(get(variant.link).content, "html.parser")
     button = page.find("a", class_="downloadButton", href=True)
     if button is None:

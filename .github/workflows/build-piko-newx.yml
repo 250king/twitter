@@ -1,4 +1,4 @@
-name: Build latest X with Piko
+name: Build latest X with Piko NewX
 
 on:
   schedule:
@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: "X version supported by latest stable Piko (blank = newest supported version)"
+        description: "X version supported by latest stable Piko NewX (blank = newest supported version)"
         required: false
         type: string
       force:
@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: piko-release-builder
+  group: piko-newx-release-builder
   cancel-in-progress: false
 
 jobs:
@@ -33,7 +33,48 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Resolve Piko and supported X version
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Resolve latest Piko NewX and Morphe CLI
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PIKO_JSON="$(gh api repos/crimera/piko-newx/releases/latest)"
+          PIKO_TAG="$(jq -r '.tag_name' <<<"$PIKO_JSON")"
+          PIKO_URL="$(jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url' <<<"$PIKO_JSON" | head -n1)"
+
+          if [[ -z "$PIKO_URL" || "$PIKO_URL" == "null" ]]; then
+            echo "::error::Could not resolve Piko NewX .mpp asset"
+            exit 1
+          fi
+
+          MORPHE_JSON="$(gh api repos/MorpheApp/morphe-desktop/releases/latest)"
+          MORPHE_TAG="$(jq -r '.tag_name' <<<"$MORPHE_JSON")"
+          MORPHE_URL="$(jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url' <<<"$MORPHE_JSON" | head -n1)"
+
+          if [[ -z "$MORPHE_URL" || "$MORPHE_URL" == "null" ]]; then
+            echo "::error::Could not resolve Morphe CLI asset"
+            exit 1
+          fi
+
+          curl --fail --location --retry 4 --retry-delay 5 "$MORPHE_URL" -o morphe.jar
+          curl --fail --location --retry 4 --retry-delay 5 "$PIKO_URL" -o piko.mpp
+          test -s morphe.jar
+          test -s piko.mpp
+
+          {
+            echo "piko_tag=$PIKO_TAG"
+            echo "morphe_tag=$MORPHE_TAG"
+          } >> "$GITHUB_OUTPUT"
+          echo "Piko NewX ${PIKO_TAG}; Morphe ${MORPHE_TAG}"
+
+      - name: Resolve supported X version
         id: target
         shell: bash
         env:
@@ -41,42 +82,19 @@ jobs:
         run: |
           set -euo pipefail
 
-          RELEASE_JSON="$(gh api repos/crimera/piko/releases/latest)"
-          PIKO_TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
-          PIKO_URL="$(jq -r '.assets[] | select(.name | endswith(".mpp")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
-
-          if [[ -z "$PIKO_URL" || "$PIKO_URL" == "null" ]]; then
-            echo "::error::Could not resolve Piko .mpp asset"
-            exit 1
-          fi
-
-          PATCHES_JSON="$(
-            curl --fail --silent --show-error --location \
-              "https://raw.githubusercontent.com/crimera/piko/${PIKO_TAG}/patches-list.json"
-          )"
-
           mapfile -t TARGETS < <(
-            jq -r '
-              [
-                .patches[].compatiblePackages[]?
-                | select(.packageName == "com.twitter.android")
-                | .targets[]?
-                | select(.isExperimental != true)
-                | .version
-              ]
-              | unique
-              | .[]
-            ' <<<"$PATCHES_JSON"
+            java -jar morphe.jar list-versions --patches piko.mpp -f com.twitter.android \
+              | sed -nE 's/^[[:space:]]*([^[:space:]]+)[[:space:]]+\([0-9]+ patches?\)[[:space:]]*$/\1/p'
           )
 
           if (( ${#TARGETS[@]} == 0 )); then
-            echo "::error::Piko ${PIKO_TAG} exposes no stable X target"
+            echo "::error::Piko NewX ${{ steps.upstream.outputs.piko_tag }} exposes no stable X target"
             exit 1
           fi
 
           if [[ -n "$REQUESTED_VERSION" ]]; then
             if ! printf '%s\n' "${TARGETS[@]}" | grep -Fxq "$REQUESTED_VERSION"; then
-              echo "::error::X ${REQUESTED_VERSION} is not supported by Piko ${PIKO_TAG}"
+              echo "::error::X ${REQUESTED_VERSION} is not supported by Piko NewX ${{ steps.upstream.outputs.piko_tag }}"
               echo "Supported: ${TARGETS[*]}"
               exit 1
             fi
@@ -86,9 +104,7 @@ jobs:
           fi
 
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "piko_tag=$PIKO_TAG" >> "$GITHUB_OUTPUT"
-          echo "piko_url=$PIKO_URL" >> "$GITHUB_OUTPUT"
-          echo "Piko ${PIKO_TAG} -> X ${VERSION}"
+          echo "Piko NewX ${{ steps.upstream.outputs.piko_tag }} -> X $VERSION"
 
       - name: Check whether release already exists
         id: existing
@@ -106,13 +122,6 @@ jobs:
       - name: Stop when already published
         if: steps.existing.outputs.exists == 'true' && inputs.force != true
         run: echo "Nothing to do; this version is already published."
-
-      - name: Set up Java
-        if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: "21"
 
       - name: Set up Python
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
@@ -169,32 +178,7 @@ jobs:
           set -euo pipefail
           python scripts/apkmirror.py download '${{ steps.target.outputs.version }}' work/x.apkm
           test -s work/x.apkm
-
-      - name: Download latest stable Morphe CLI
-        if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        id: morphe
-        shell: bash
-        run: |
-          set -euo pipefail
-          RELEASE_JSON="$(gh api repos/MorpheApp/morphe-desktop/releases/latest)"
-          TAG="$(jq -r '.tag_name' <<<"$RELEASE_JSON")"
-          URL="$(jq -r '.assets[] | select(.name | endswith("-all.jar")) | .browser_download_url' <<<"$RELEASE_JSON" | head -n1)"
-          if [[ -z "$URL" || "$URL" == "null" ]]; then
-            echo "Could not resolve Morphe CLI asset" >&2
-            exit 1
-          fi
-          curl --fail --location --retry 4 --retry-delay 5 "$URL" -o morphe.jar
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-
-      - name: Download Piko patches
-        if: steps.existing.outputs.exists != 'true' || inputs.force == true
-        shell: bash
-        run: |
-          set -euo pipefail
-          curl --fail --location --retry 4 --retry-delay 5 \
-            '${{ steps.target.outputs.piko_url }}' \
-            -o piko.mpp
-          test -s piko.mpp
+          unzip -tq work/x.apkm >/dev/null
 
       - name: Build and sign all variants
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
@@ -211,35 +195,29 @@ jobs:
           test -x "$APKSIGNER"
           test -x "$ZIPALIGN"
 
-          VARIANTS=(twitter-material twitter x-material x)
-          ARCHES=(universal arm64-v8a armeabi-v7a x86 x86_64)
+          BRANDS=(twitter x)
+          ARCHES=(universal arm64-v8a armeabi-v7a)
 
-          for VARIANT in "${VARIANTS[@]}"; do
-            case "$VARIANT" in
-              twitter-material)
-                PATCH_FLAGS=(-e "Bring back twitter" -e "Dynamic color")
-                ;;
+          for BRAND in "${BRANDS[@]}"; do
+            case "$BRAND" in
               twitter)
-                PATCH_FLAGS=(-e "Bring back twitter" -d "Dynamic color")
-                ;;
-              x-material)
-                PATCH_FLAGS=(-d "Bring back twitter" -e "Dynamic color")
+                PATCH_FLAGS=(-e "NewX: Restore Twitter branding")
                 ;;
               x)
-                PATCH_FLAGS=(-d "Bring back twitter" -d "Dynamic color")
+                PATCH_FLAGS=(-d "NewX: Restore Twitter branding")
                 ;;
             esac
 
             for ARCH in "${ARCHES[@]}"; do
-              echo "Building ${VARIANT} / ${ARCH}..."
+              echo "Building ${BRAND} / ${ARCH}..."
               STRIP_FLAGS=()
               if [[ "$ARCH" != "universal" ]]; then
                 STRIP_FLAGS=(--striplibs "$ARCH")
               fi
 
-              UNSIGNED="work/${VARIANT}-${ARCH}-unsigned.apk"
-              ALIGNED="work/${VARIANT}-${ARCH}-aligned.apk"
-              FINAL="dist/x-piko-${VERSION}-${VARIANT}-${ARCH}.apk"
+              UNSIGNED="work/${BRAND}-${ARCH}-unsigned.apk"
+              ALIGNED="work/${BRAND}-${ARCH}-aligned.apk"
+              FINAL="dist/x-piko-${VERSION}-${BRAND}-${ARCH}.apk"
 
               java -jar morphe.jar patch \
                 --patches piko.mpp \
@@ -270,8 +248,8 @@ jobs:
         run: |
           set -euo pipefail
           COUNT="$(find dist -maxdepth 1 -type f -name '*.apk' | wc -l)"
-          if [[ "$COUNT" -ne 20 ]]; then
-            echo "Expected 20 APKs, found $COUNT" >&2
+          if [[ "$COUNT" -ne 6 ]]; then
+            echo "Expected 6 APKs, found $COUNT" >&2
             exit 1
           fi
 
@@ -293,27 +271,27 @@ jobs:
           set -euo pipefail
           VERSION='${{ steps.target.outputs.version }}'
           cat > release-notes.md <<EOF
-          Automated X/Twitter build patched with Piko and signed with the repository owner's Android signing key.
+          Automated X/Twitter build patched with the Piko NewX bundle and signed with the repository owner's Android signing key.
 
           - X: \`${VERSION}\`
-          - Piko: \`${{ steps.target.outputs.piko_tag }}\`
-          - Morphe: \`${{ steps.morphe.outputs.tag }}\`
-          - Source APKM: APKMirror universal bundle
+          - Piko NewX: \`${{ steps.upstream.outputs.piko_tag }}\`
+          - Morphe: \`${{ steps.upstream.outputs.morphe_tag }}\`
+          - Source APKM: APKMirror ARM bundle (arm64-v8a + armeabi-v7a)
 
-          UI / branding variants:
-          - \`twitter-material\`: Twitter branding + Material You dynamic color
-          - \`twitter\`: Twitter branding + standard Twitter/X colors
-          - \`x-material\`: X branding + Material You dynamic color
-          - \`x\`: X branding + standard Twitter/X colors
+          Branding variants:
+          - \`twitter\`: Twitter name and icons restored
+          - \`x\`: default X branding
 
-          Architecture variants for every UI / branding variant:
+          Architecture variants for every branding variant:
           - \`arm64-v8a\`: most modern Android phones
           - \`armeabi-v7a\`: older 32-bit ARM devices
-          - \`x86_64\`: 64-bit Intel emulators / Chromebooks
-          - \`x86\`: legacy 32-bit Intel emulators
-          - \`universal\`: keeps all native architectures
+          - \`universal\`: keeps both ARM architectures
 
-          Total: 4 UI / branding variants × 5 architecture variants = 20 APKs.
+          Material You and the other themes are runtime settings. Open the patched app's Piko settings, then Appearance -> Theme. They are not separate APKs.
+
+          X 12.38+ no longer ships x86 / x86_64 native libraries, so no x86 emulator builds are produced.
+
+          Total: 2 branding variants × 3 architecture variants = 6 APKs.
           EOF
 
           gh release create "$VERSION" dist/*.apk \
