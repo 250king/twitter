@@ -124,6 +124,29 @@ jobs:
         if: steps.existing.outputs.exists == 'true' && inputs.force != true
         run: echo "Nothing to do; this version is already published."
 
+      - name: Write job summary
+        if: always()
+        shell: bash
+        env:
+          PIKO_TAG: ${{ steps.upstream.outputs.piko_tag }}
+          MORPHE_TAG: ${{ steps.upstream.outputs.morphe_tag }}
+          VERSION: ${{ steps.target.outputs.version }}
+          EXISTS: ${{ steps.existing.outputs.exists }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          {
+            echo "### Piko NewX build"
+            echo ""
+            echo "- Piko NewX: \`${PIKO_TAG:-unknown}\`"
+            echo "- Morphe: \`${MORPHE_TAG:-unknown}\`"
+            echo "- X: \`${VERSION:-unknown}\`"
+            if [[ "$EXISTS" == "true" && "$FORCE" != "true" ]]; then
+              echo "- Result: skipped, release already exists (use force to rebuild)"
+            else
+              echo "- Result: building"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: Set up Python
         if: steps.existing.outputs.exists != 'true' || inputs.force == true
         uses: actions/setup-python@v6
